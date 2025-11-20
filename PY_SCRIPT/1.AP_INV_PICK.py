@@ -322,45 +322,77 @@ if __name__ == "__main__":
         cursor = conn.cursor()
 
         # ---------------------------------------------------------
-        # 🔥 STEP 1 — SUPPLIER MASTER → UPDATE INVOICE HEADERS
+        #  STEP 1 — SUPPLIER MASTER → UPDATE INVOICE HEADERS
         # ---------------------------------------------------------
-        print("🔍 Fetching distinct supplier numbers from invoice headers...")
+        print("🔍 Fetching invoices with supplier information...")
+
+        # Fetch distinct suppliers from headers including null supplier_number
         cursor.execute(f"""
-            SELECT DISTINCT supplier_number
+            SELECT DISTINCT supplier_number, supplier_name
             FROM "{SCHEMA}"."{TABLE_HEADERS}"
-            WHERE supplier_number IS NOT NULL AND supplier_number <> '';
+            WHERE status='A'
+              AND (erp_interface_status IS NULL OR erp_interface_status = 'Error');
         """)
-        supplier_numbers = [row[0] for row in cursor.fetchall()]
 
-        print(f"📌 Found {len(supplier_numbers)} suppliers to process.\n")
+        supplier_rows = cursor.fetchall()
 
-        for sup in supplier_numbers:
-            print(f"👉 Processing supplier: {sup}")
+        print(f"📌 Found {len(supplier_rows)} supplier records to process.\n")
 
-            cursor.execute(f"""
-                SELECT supplier_name, vendor_site_code, assigned_bu
-                FROM "{SCHEMA}"."{SUPPLIER_MASTER}"
-                WHERE supplier_number = %s
-                LIMIT 1;
-            """, (sup,))
-            data = cursor.fetchone()
+        for sup_num, sup_name in supplier_rows:
+
+            if sup_num and sup_num.strip() != "":
+                # ---------------------------------------------------------
+                # CASE 1: Supplier number exists → lookup by supplier_number
+                # ---------------------------------------------------------
+                print(f"👉 Processing supplier_number: {sup_num}")
+
+                cursor.execute(f"""
+                    SELECT supplier_name, vendor_site_code, assigned_bu
+                    FROM "{SCHEMA}"."{SUPPLIER_MASTER}"
+                    WHERE supplier_number = %s
+                    LIMIT 1;
+                """, (sup_num,))
+                data = cursor.fetchone()
+
+            else:
+                # ---------------------------------------------------------
+                # CASE 2: Supplier number is NULL → lookup by supplier_name
+                # ---------------------------------------------------------
+                print(f"👉 supplier_number is NULL → using supplier_name: {sup_name}")
+
+                cursor.execute(f"""
+                    SELECT supplier_number, supplier_name, vendor_site_code, assigned_bu
+                    FROM "{SCHEMA}"."{SUPPLIER_MASTER}"
+                    WHERE LOWER(supplier_name) = LOWER(%s)
+                    LIMIT 1;
+                """, (sup_name,))
+                data = cursor.fetchone()
+
+                # Extract the real supplier_number if found
+                if data:
+                    sup_num, supplier_name, vendor_site_code, assigned_bu = data
+                else:
+                    print(f"❌ No supplier match found for supplier_name = {sup_name}")
+                    continue  # skip this supplier_name
 
             if data:
-                supplier_name, vendor_site_code, assigned_bu = data
+                # assign_correct values if the search was by supplier_number
+                if len(data) == 3:
+                    supplier_name, vendor_site_code, assigned_bu = data
 
                 cursor.execute(f"""
                     UPDATE "{SCHEMA}"."{TABLE_HEADERS}"
                     SET supplier_name = %s,
                         supplier_site = %s,
-                        business_unit = %s
-                    WHERE supplier_number = %s
+                        business_unit = %s,
+                        supplier_number = %s
+                    WHERE (supplier_number = %s OR (supplier_number IS NULL AND supplier_name = %s))
                       AND status = 'A'
                       AND (erp_interface_status IS NULL OR erp_interface_status = 'Error');
-                """, (supplier_name, vendor_site_code, assigned_bu, sup))
+                """, (supplier_name, vendor_site_code, assigned_bu, sup_num, sup_num, sup_name))
 
                 conn.commit()
-
-                print(f"✔ Updated supplier header rows for supplier {sup} (only status 'A')")
+                print(f"✔ Updated header rows for supplier_number={sup_num} supplier_name={sup_name}")
 
         print("\n✅ Supplier Master → Header Update Completed\n")
 
@@ -377,6 +409,42 @@ if __name__ == "__main__":
 
         df_headers = pd.read_sql(query_headers, conn)
         print(f"✅ Header Records Loaded: {len(df_headers)}")
+
+        # ---------------------------------------------
+        # FIX SOURCE COLUMN → Convert to Proper Case
+        # ---------------------------------------------
+        if "source" in df_headers.columns:
+            df_headers["source"] = df_headers["source"].astype(str).str.strip().str.title()
+            print("✔ source column normalized to Proper Case (e.g., 'External')")
+
+        # ---------------------------------------------------------
+        # FIX: invoice_type → default 'STANDARD' when NULL or empty
+        # ---------------------------------------------------------
+        if "invoice_type" in df_headers.columns:
+            df_headers["invoice_type"] = (
+                df_headers["invoice_type"]
+                .fillna("STANDARD")  # Replace NULL first
+                .replace("", "STANDARD")  # Replace empty string
+                .replace("None", "STANDARD")  # Replace string 'None'
+                .astype(str)  # Convert AFTER cleaning
+                .str.strip()
+                .str.upper()  # Oracle FBDI expects uppercase
+            )
+            print("✔ invoice_type defaulted to STANDARD if NULL/empty")
+
+        # ---------------------------------------------------------
+        # FIX: payment_terms → default 'Immediate' when NULL or empty
+        # ---------------------------------------------------------
+        if "payment_terms" in df_headers.columns:
+            df_headers["payment_terms"] = (
+                df_headers["payment_terms"]
+                .fillna("Immediate")  # FIX 1: replace NULL first
+                .replace("", "Immediate")  # FIX 2: replace empty strings
+                .replace("None", "Immediate")  # FIX 3: replace Python None as str
+                .astype(str)  # convert to string AFTER cleanup
+                .str.strip()
+            )
+            print("✔ payment_terms defaulted to Immediate if NULL/empty")
 
         # Uppercase invoice_type
         if "invoice_type" in df_headers.columns:
