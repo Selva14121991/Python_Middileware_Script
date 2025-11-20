@@ -165,10 +165,10 @@ LINES_REAL_COLS = [
     "line_number",
     "line_type",
     "amount",
-    'NULL AS invoice_quantity',
+    "invoice_quantity",
     'NULL AS unit_price',
     'NULL AS uom',
-    'NULL AS description',
+    "description",
     'NULL AS po_number',
     'NULL AS po_line_number',
     'NULL AS po_schedule_number',
@@ -199,11 +199,11 @@ LINES_REAL_COLS = [
     'NULL AS product_type',
     'NULL AS assessable_value',
     'NULL AS product_category',
-    'NULL AS tax_control_amount',
-    'NULL AS tax_regime_code',
-    'NULL AS tax',
-    'NULL AS tax_status_code',
-    'NULL AS tax_jurisdiction_code',
+    "tax_control_amount",
+    "tax_regime_code",
+    "tax",
+    "tax_status_code",
+    "tax_jurisdiction_code",
     "tax_rate_code",
     'NULL AS tax_rate',
     'NULL AS withholding_tax_group',
@@ -398,6 +398,12 @@ if __name__ == "__main__":
 
         df_lines = pd.read_sql(query_lines, conn)
         print(f"✅ Line Records Loaded: {len(df_lines)}")
+        # ---------------------------------------------------------
+        # 🔥 REQUIRED FIX: convert line_type → UPPERCASE
+        # ---------------------------------------------------------
+        if "line_type" in df_lines.columns:
+            df_lines["line_type"] = df_lines["line_type"].astype(str).str.upper()
+            print("line_type values converted to UPPERCASE")
 
         # ---------------------------------------------------------
         # 🔥 STEP 4 — SPLIT PER BUSINESS UNIT & GENERATE FBDI
