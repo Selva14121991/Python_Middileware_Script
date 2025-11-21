@@ -9,18 +9,23 @@ import csv
 from io import StringIO
 import psycopg2
 import zipfile
+import time
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================== CONFIGURATION ==================
-INPUT_FOLDER = r"D:\APInvoice\FBDI\UCMLOAD"
-PROCESSED_FOLDER = r"D:\APInvoice\FBDI\UCMLOAD\processed"
+INPUT_FOLDER = r"D:\APInvoice\FBDI\UCMLOAD\Inbound"
+PROCESSED_FOLDER = r"D:\APInvoice\FBDI\UCMLOAD\Archive"
+ERROR_FOLDER = r"D:\APInvoice\FBDI\UCMLOAD\Error"
+
 ZIP_PREFIX = "apinvoiceimport"
 
 FUSION_BASE_URL = "https://fa-euth-dev58-saasfademo1.ds-fa.oraclepdemos.com:443"
 
 REST_ENDPOINT = f"{FUSION_BASE_URL}/fscmRestApi/resources/11.13.18.05/erpintegrations"
 REPORT_SERVICE = f"{FUSION_BASE_URL}/xmlpserver/services/ExternalReportWSSService"
+
+ESS_STATUS_ENDPOINT = f"{FUSION_BASE_URL}/fscmRestApi/resources/11.13.18.05/erpintegrations"
 
 BI_REPORT_PATH = "/Custom/Master Integration Reports/BU Det/BU Det Rpt.xdo"
 
@@ -55,11 +60,13 @@ def get_zip_files():
 
 def extract_bu_name(zip_file):
     base = os.path.basename(zip_file)
-    cleaned = base.replace("_apinvoiceimport.zip", "").replace("_", " ")
-    return cleaned.strip()
+    parts = base.split("_apinvoiceimport", 1)
+    bu_raw = parts[0]
+    bu_name = bu_raw.replace("_", " ").strip()
+    return bu_name
 
 
-# -------- BI REPORT CALL (CSV Output) ----------
+# -------- BI REPORT CALL ----------
 def call_bi_report(bu_name):
     print(f"📡 Calling BI Report for BU: {bu_name}")
 
@@ -107,7 +114,6 @@ def call_bi_report(bu_name):
     bu_id = rows[0]["BU_ID"].strip()
     ledger_id = rows[0]["BU_LEDGER_ID"].strip()
 
-    print(f"➡ BU_ID={bu_id}, LEDGER_ID={ledger_id}")
     return bu_id, ledger_id
 
 
@@ -141,13 +147,42 @@ def upload_to_fusion(zip_file, parameter_list):
                          headers={"Content-Type": "application/json"},
                          verify=False)
 
-    print("Response:", resp.text)
-
     resp_json = resp.json()
     req_id = resp_json.get("ReqstId") or resp_json.get("RequestId") or resp_json.get("requestId")
-    print(f"✅ ESS RequestId: {req_id}")
-
     return req_id
+
+
+# -------- ESS JOB STATUS CHECK --------
+def wait_for_ess_status(req_id):
+    print(f"⏳ Checking ESS Job Status for Request ID: {req_id}")
+
+    while True:
+        url = f"{ESS_STATUS_ENDPOINT}?finder=ESSJobStatusRF;requestId={req_id}"
+        headers = {"Content-Type": "application/vnd.oracle.adf.resourceitem+json"}
+
+        resp = requests.get(url, headers=headers,
+                            auth=(USERNAME, PASSWORD), verify=False)
+
+        if resp.status_code != 200:
+            print("⚠ ESS Status API Error:", resp.text)
+            time.sleep(10)
+            continue
+
+        data = resp.json()
+        status = data["items"][0]["RequestStatus"]
+
+        print(f"➡ Current ESS Status: {status}")
+
+        if status == "SUCCEEDED":
+            return "SUCCESS"
+
+        if status in ("ERROR", "ERROR_IN_JOB", "ERROR_IN_CHILD_JOB"):
+            return "ERROR"
+
+        if status == "WARNING":
+            return "ERROR"  # treat warning as failure per requirement
+
+        time.sleep(10)
 
 
 # -------- Extract Invoice Numbers from ZIP --------
@@ -164,7 +199,6 @@ def extract_invoice_numbers(zip_file):
                     if len(row) > 3:
                         invoice_numbers.append(row[3])
 
-    print(f"🧾 Extracted {len(invoice_numbers)} invoice numbers")
     return invoice_numbers
 
 
@@ -182,20 +216,41 @@ def insert_request_ids(req_id, invoice_numbers):
     batch_values = [(req_id, inv) for inv in invoice_numbers if inv and inv.strip()]
 
     cur.executemany(update_sql, batch_values)
-
     conn.commit()
-    updated_count = cur.rowcount
 
     cur.close()
     conn.close()
 
-    print(f"📦 Bulk updated load_request_id for {updated_count} invoices")
+
+# -------- BULK UPDATE status + erp_interface_status --------
+def update_invoice_status(invoice_numbers, status_code, interface_status):
+    conn = psycopg2.connect(**DB_CONFIG)
+    cur = conn.cursor()
+
+    update_sql = f'''
+        UPDATE "{SCHEMA}"."oracle_ap_invoice_headers"
+        SET status = %s,
+            erp_interface_status = %s
+        WHERE invoice_number = %s;
+    '''
+
+    batch_values = [(status_code, interface_status, inv)
+                    for inv in invoice_numbers if inv and inv.strip()]
+
+    cur.executemany(update_sql, batch_values)
+    conn.commit()
+
+    cur.close()
+    conn.close()
+
+    print(f"🔄 Updated invoices → {status_code} / {interface_status}")
 
 
-def move_to_processed(zip_file):
-    os.makedirs(PROCESSED_FOLDER, exist_ok=True)
-    shutil.move(zip_file, os.path.join(PROCESSED_FOLDER, os.path.basename(zip_file)))
-    print("📁 Moved to processed")
+def move_file(zip_file, status):
+    dest = PROCESSED_FOLDER if status == "SUCCESS" else ERROR_FOLDER
+    os.makedirs(dest, exist_ok=True)
+    shutil.move(zip_file, os.path.join(dest, os.path.basename(zip_file)))
+    print(f"📁 File moved to {dest}")
 
 
 # ================== MAIN LOOP ==================
@@ -210,18 +265,23 @@ if __name__ == "__main__":
             print(f"\n========= Processing {zip_file} =========")
 
             bu_name = extract_bu_name(zip_file)
-
             bu_id, ledger_id = call_bi_report(bu_name)
 
             params = generate_parameter_list(bu_id, ledger_id)
-
             req_id = upload_to_fusion(zip_file, params)
 
             invoice_numbers = extract_invoice_numbers(zip_file)
-
             insert_request_ids(req_id, invoice_numbers)
 
-            move_to_processed(zip_file)
+            ess_status = wait_for_ess_status(req_id)
+
+            # ⭐ NEW REQUIRED LOGIC ⭐
+            if ess_status == "SUCCESS":
+                update_invoice_status(invoice_numbers, "P", "Processed")
+            else:
+                update_invoice_status(invoice_numbers, "IE", "Interface Loader Error")
+
+            move_file(zip_file, ess_status)
 
         except Exception as e:
             print(f"❌ ERROR: {e}")

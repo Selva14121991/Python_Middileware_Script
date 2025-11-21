@@ -2,6 +2,8 @@ import os
 import zipfile
 import psycopg2
 import pandas as pd
+from datetime import datetime
+from psycopg2.extras import execute_values
 
 # ================== CONFIGURATION ==================
 DB_CONFIG = {
@@ -17,13 +19,12 @@ TABLE_HEADERS = "oracle_ap_invoice_headers"
 TABLE_LINES = "oracle_ap_invoice_lines"
 SUPPLIER_MASTER = "Oracle_Supplier_Master_Details"
 
-OUTPUT_FOLDER = r"D:\APInvoice\FBDI\UCMLOAD"
+OUTPUT_FOLDER = r"D:\APInvoice\FBDI\UCMLOAD\Inbound"
 
 # ======================================================================
 # ================== REQUIRED COLUMNS (REAL VALUES) ====================
 # ======================================================================
 
-# Columns from DB that should retain actual data (headers)
 HEADER_REAL_COLS = [
     "invoice_id",
     "business_unit",
@@ -64,6 +65,9 @@ HEADER_REAL_COLS = [
     "liability_combination",
     'NULL AS document_category_code',
     'NULL AS voucher_number',
+    'NULL AS Requester_First_Name',
+    'NULL AS Requester_Last_Name',
+    'NULL AS Requester_Employee_Number',
     'NULL AS delivery_channel_code',
     'NULL AS bank_charge_bearer',
     'NULL AS remit_to_supplier',
@@ -87,6 +91,7 @@ HEADER_REAL_COLS = [
     'NULL AS tax_invoice_recording_date',
     'NULL AS supplier_tax_invoice_date',
     'NULL AS supplier_tax_invoice_conversion_rate',
+    'NULL AS Port_Of_Entry_Code',
     'NULL AS correction_year',
     'NULL AS correction_Period',
     'NULL AS import_document_number',
@@ -95,7 +100,10 @@ HEADER_REAL_COLS = [
     "calculate_tax_during_import",
     'NULL AS add_tax_to_invoice_amount',
     'NULL AS attribute_category',
-    'NULL AS attribute_1_fbdi',
+
+    # ⭐ THIS FIELD WILL BE AUTO-FILLED IN THE CSV
+    "attribute_1_fbdi",
+
     'NULL AS attribute_2_fbdi',
     'NULL AS attribute_3_fbdi',
     'NULL AS attribute_4_fbdi',
@@ -321,80 +329,31 @@ if __name__ == "__main__":
         conn = psycopg2.connect(**DB_CONFIG)
         cursor = conn.cursor()
 
-        # ---------------------------------------------------------
-        #  STEP 1 — SUPPLIER MASTER → UPDATE INVOICE HEADERS
-        # ---------------------------------------------------------
-        print("🔍 Fetching invoices with supplier information...")
+        # ================== NEW LOGIC TO BULK UPDATE HEADER BASED ON SUPPLIER MASTER ==================
+        supplier_master_query = """
+            SELECT distinct supplier_name, supplier_number, vendor_site_code, assigned_bu
+            FROM "DocAI"."Oracle_Supplier_Master_Details";
+        """
+        df_supplier_master = pd.read_sql(supplier_master_query, conn)
 
-        # Fetch distinct suppliers from headers including null supplier_number
-        cursor.execute(f"""
-            SELECT DISTINCT supplier_number, supplier_name
-            FROM "{SCHEMA}"."{TABLE_HEADERS}"
-            WHERE status='A'
-              AND (erp_interface_status IS NULL OR erp_interface_status = 'Error');
-        """)
+        # Prepare the update query with data from supplier master
+        update_query = f"""
+            UPDATE "{SCHEMA}"."{TABLE_HEADERS}" AS h
+            SET
+                supplier_number = data.supplier_number,
+                supplier_site = data.vendor_site_code,
+                business_unit = data.assigned_bu
+            FROM (VALUES %s) AS data(supplier_name, supplier_number, vendor_site_code, assigned_bu)
+            WHERE h.supplier_name = data.supplier_name;
+        """
 
-        supplier_rows = cursor.fetchall()
+        # Prepare data for bulk update from dataframe rows
+        update_data = [(row.supplier_name, row.supplier_number, row.vendor_site_code, row.assigned_bu)
+                       for row in df_supplier_master.itertuples()]
 
-        print(f"📌 Found {len(supplier_rows)} supplier records to process.\n")
-
-        for sup_num, sup_name in supplier_rows:
-
-            if sup_num and sup_num.strip() != "":
-                # ---------------------------------------------------------
-                # CASE 1: Supplier number exists → lookup by supplier_number
-                # ---------------------------------------------------------
-                print(f"👉 Processing supplier_number: {sup_num}")
-
-                cursor.execute(f"""
-                    SELECT supplier_name, vendor_site_code, assigned_bu
-                    FROM "{SCHEMA}"."{SUPPLIER_MASTER}"
-                    WHERE supplier_number = %s
-                    LIMIT 1;
-                """, (sup_num,))
-                data = cursor.fetchone()
-
-            else:
-                # ---------------------------------------------------------
-                # CASE 2: Supplier number is NULL → lookup by supplier_name
-                # ---------------------------------------------------------
-                print(f"👉 supplier_number is NULL → using supplier_name: {sup_name}")
-
-                cursor.execute(f"""
-                    SELECT supplier_number, supplier_name, vendor_site_code, assigned_bu
-                    FROM "{SCHEMA}"."{SUPPLIER_MASTER}"
-                    WHERE LOWER(supplier_name) = LOWER(%s)
-                    LIMIT 1;
-                """, (sup_name,))
-                data = cursor.fetchone()
-
-                # Extract the real supplier_number if found
-                if data:
-                    sup_num, supplier_name, vendor_site_code, assigned_bu = data
-                else:
-                    print(f"❌ No supplier match found for supplier_name = {sup_name}")
-                    continue  # skip this supplier_name
-
-            if data:
-                # assign_correct values if the search was by supplier_number
-                if len(data) == 3:
-                    supplier_name, vendor_site_code, assigned_bu = data
-
-                cursor.execute(f"""
-                    UPDATE "{SCHEMA}"."{TABLE_HEADERS}"
-                    SET supplier_name = %s,
-                        supplier_site = %s,
-                        business_unit = %s,
-                        supplier_number = %s
-                    WHERE (supplier_number = %s OR (supplier_number IS NULL AND supplier_name = %s))
-                      AND status = 'A'
-                      AND (erp_interface_status IS NULL OR erp_interface_status = 'Error');
-                """, (supplier_name, vendor_site_code, assigned_bu, sup_num, sup_num, sup_name))
-
-                conn.commit()
-                print(f"✔ Updated header rows for supplier_number={sup_num} supplier_name={sup_name}")
-
-        print("\n✅ Supplier Master → Header Update Completed\n")
+        execute_values(cursor, update_query, update_data)
+        conn.commit()
+        print(f"✔ Bulk updated header table supplier info from master data")
 
         # ---------------------------------------------------------
         # 🔥 STEP 2 — LOAD HEADER DATA
@@ -410,45 +369,27 @@ if __name__ == "__main__":
         df_headers = pd.read_sql(query_headers, conn)
         print(f"✅ Header Records Loaded: {len(df_headers)}")
 
-        # ---------------------------------------------
-        # FIX SOURCE COLUMN → Convert to Proper Case
-        # ---------------------------------------------
-        if "source" in df_headers.columns:
-            df_headers["source"] = df_headers["source"].astype(str).str.strip().str.title()
-            print("✔ source column normalized to Proper Case (e.g., 'External')")
+        # FIX source → Proper Case
+        df_headers["source"] = df_headers["source"].astype(str).str.title()
 
-        # ---------------------------------------------------------
-        # FIX: invoice_type → default 'STANDARD' when NULL or empty
-        # ---------------------------------------------------------
-        if "invoice_type" in df_headers.columns:
-            df_headers["invoice_type"] = (
-                df_headers["invoice_type"]
-                .fillna("STANDARD")  # Replace NULL first
-                .replace("", "STANDARD")  # Replace empty string
-                .replace("None", "STANDARD")  # Replace string 'None'
-                .astype(str)  # Convert AFTER cleaning
-                .str.strip()
-                .str.upper()  # Oracle FBDI expects uppercase
-            )
-            print("✔ invoice_type defaulted to STANDARD if NULL/empty")
+        # FIX invoice_type
+        df_headers["invoice_type"] = (
+            df_headers["invoice_type"]
+            .fillna("STANDARD")
+            .replace("", "STANDARD")
+            .replace("None", "STANDARD")
+            .astype(str)
+            .str.upper()
+        )
 
-        # ---------------------------------------------------------
-        # FIX: payment_terms → default 'Immediate' when NULL or empty
-        # ---------------------------------------------------------
-        if "payment_terms" in df_headers.columns:
-            df_headers["payment_terms"] = (
-                df_headers["payment_terms"]
-                .fillna("Immediate")  # FIX 1: replace NULL first
-                .replace("", "Immediate")  # FIX 2: replace empty strings
-                .replace("None", "Immediate")  # FIX 3: replace Python None as str
-                .astype(str)  # convert to string AFTER cleanup
-                .str.strip()
-            )
-            print("✔ payment_terms defaulted to Immediate if NULL/empty")
-
-        # Uppercase invoice_type
-        if "invoice_type" in df_headers.columns:
-            df_headers["invoice_type"] = df_headers["invoice_type"].astype(str).str.upper()
+        # FIX payment_terms
+        df_headers["payment_terms"] = (
+            df_headers["payment_terms"]
+            .fillna("Immediate")
+            .replace("", "Immediate")
+            .replace("None", "Immediate")
+            .astype(str)
+        )
 
         # ---------------------------------------------------------
         # 🔥 STEP 3 — LOAD LINE DATA
@@ -465,13 +406,7 @@ if __name__ == "__main__":
         """
 
         df_lines = pd.read_sql(query_lines, conn)
-        print(f"✅ Line Records Loaded: {len(df_lines)}")
-        # ---------------------------------------------------------
-        # 🔥 REQUIRED FIX: convert line_type → UPPERCASE
-        # ---------------------------------------------------------
-        if "line_type" in df_lines.columns:
-            df_lines["line_type"] = df_lines["line_type"].astype(str).str.upper()
-            print("line_type values converted to UPPERCASE")
+        df_lines["line_type"] = df_lines["line_type"].astype(str).str.upper()
 
         # ---------------------------------------------------------
         # 🔥 STEP 4 — SPLIT PER BUSINESS UNIT & GENERATE FBDI
@@ -479,19 +414,33 @@ if __name__ == "__main__":
         for bu in df_headers['business_unit'].unique():
             print(f"\n🚀 GENERATING FBDI FOR BU: {bu}")
 
-            hdf = df_headers[df_headers['business_unit'] == bu]
-            ldf = df_lines[df_lines['invoice_id'].isin(hdf['invoice_id'])]
+            hdf = df_headers[df_headers['business_unit'] == bu].copy()
+            ldf = df_lines[df_lines['invoice_id'].isin(hdf['invoice_id'])].copy()
 
+            # ⭐ NEW → AUTO-GENERATE attribute_1_fbdi
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            auto_value = f"BDOC_{bu}_{timestamp}"
+
+            hdf["attribute_1_fbdi"] = auto_value
+            print(f"✔ attribute_1_fbdi set to → {auto_value}")
+
+            # CLEAN AND ADD END
             hdf = add_end_column(clean_nulls(hdf))
             ldf = add_end_column(clean_nulls(ldf))
 
+            # FILE PATHS
             header_csv = os.path.join(OUTPUT_FOLDER, "ApInvoicesInterface.csv")
             lines_csv = os.path.join(OUTPUT_FOLDER, "ApInvoiceLinesInterface.csv")
 
             export_to_csv(hdf, header_csv)
             export_to_csv(ldf, lines_csv)
 
-            zip_path = os.path.join(OUTPUT_FOLDER, f"{bu.replace(' ', '_')}_apinvoiceimport.zip")
+            # ZIP NAME WITH BU + TIMESTAMP
+            zip_path = os.path.join(
+                OUTPUT_FOLDER,
+                f"{bu.replace(' ', '_')}_apinvoiceimport_{timestamp}.zip"
+            )
+
             zip_files(header_csv, lines_csv, zip_path)
 
             os.remove(header_csv)

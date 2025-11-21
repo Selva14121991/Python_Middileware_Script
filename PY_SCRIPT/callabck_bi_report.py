@@ -54,7 +54,7 @@ def get_load_request_ids():
         SELECT DISTINCT load_request_id
         FROM "{SCHEMA}"."{TABLE_HEADERS}"
         WHERE load_request_id IS NOT NULL
-          AND (erp_interface_status IS NULL OR erp_interface_status = 'Error')
+          AND (erp_interface_status IS NULL OR erp_interface_status = 'Error' OR  status = 'P')
         ORDER BY 1;
     '''
     df = pd.read_sql_query(query, conn)
@@ -137,11 +137,12 @@ def update_invoice_bulk(rows):
     update_header_sql = f"""
         UPDATE "{SCHEMA}"."{TABLE_HEADERS}"
         SET erp_interface_status = %s,
+                            status = %s,
             erp_interface_description = %s
         WHERE invoice_number = %s;
     """
     header_values = [
-        (r.get("DOC_STATUS"), r.get("ERROR_DESCRIPTION"), r.get("INVOICE_NUM"))
+        (r.get("DOC_STATUS"),r.get("STATUS"), r.get("ERROR_DESCRIPTION"), r.get("INVOICE_NUM"))
         for r in rows
     ]
     cur.executemany(update_header_sql, header_values)
