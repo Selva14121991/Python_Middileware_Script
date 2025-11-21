@@ -101,7 +101,6 @@ HEADER_REAL_COLS = [
     'NULL AS add_tax_to_invoice_amount',
     'NULL AS attribute_category',
 
-    # ⭐ THIS FIELD WILL BE AUTO-FILLED IN THE CSV
     "attribute_1_fbdi",
 
     'NULL AS attribute_2_fbdi',
@@ -167,7 +166,6 @@ HEADER_REAL_COLS = [
     'NULL AS remit_to_digital_account'
 ]
 
-# Columns from DB that should retain actual data (lines)
 LINES_REAL_COLS = [
     "invoice_id",
     "line_number",
@@ -329,14 +327,12 @@ if __name__ == "__main__":
         conn = psycopg2.connect(**DB_CONFIG)
         cursor = conn.cursor()
 
-        # ================== NEW LOGIC TO BULK UPDATE HEADER BASED ON SUPPLIER MASTER ==================
         supplier_master_query = """
             SELECT distinct supplier_name, supplier_number, vendor_site_code, assigned_bu
             FROM "DocAI"."Oracle_Supplier_Master_Details";
         """
         df_supplier_master = pd.read_sql(supplier_master_query, conn)
 
-        # Prepare the update query with data from supplier master
         update_query = f"""
             UPDATE "{SCHEMA}"."{TABLE_HEADERS}" AS h
             SET
@@ -347,7 +343,6 @@ if __name__ == "__main__":
             WHERE h.supplier_name = data.supplier_name;
         """
 
-        # Prepare data for bulk update from dataframe rows
         update_data = [(row.supplier_name, row.supplier_number, row.vendor_site_code, row.assigned_bu)
                        for row in df_supplier_master.itertuples()]
 
@@ -361,7 +356,7 @@ if __name__ == "__main__":
         query_headers = f"""
             SELECT {', '.join(HEADER_REAL_COLS)}
             FROM "{SCHEMA}"."{TABLE_HEADERS}"
-            WHERE status='A'
+            WHERE (status = 'A' OR status = 'E')
               AND business_unit <> ''
               AND (erp_interface_status IS NULL OR erp_interface_status = 'Error');
         """
@@ -369,10 +364,8 @@ if __name__ == "__main__":
         df_headers = pd.read_sql(query_headers, conn)
         print(f"✅ Header Records Loaded: {len(df_headers)}")
 
-        # FIX source → Proper Case
         df_headers["source"] = df_headers["source"].astype(str).str.title()
 
-        # FIX invoice_type
         df_headers["invoice_type"] = (
             df_headers["invoice_type"]
             .fillna("STANDARD")
@@ -382,7 +375,6 @@ if __name__ == "__main__":
             .str.upper()
         )
 
-        # FIX payment_terms
         df_headers["payment_terms"] = (
             df_headers["payment_terms"]
             .fillna("Immediate")
@@ -399,7 +391,7 @@ if __name__ == "__main__":
             FROM "{SCHEMA}"."{TABLE_LINES}"
             WHERE invoice_id IN (
                 SELECT invoice_id FROM "{SCHEMA}"."{TABLE_HEADERS}"
-                WHERE status='A'
+                WHERE  (status = 'A' OR status = 'E')
                   AND business_unit <> ''
                   AND (erp_interface_status IS NULL OR erp_interface_status = 'Error')
             );
@@ -407,6 +399,15 @@ if __name__ == "__main__":
 
         df_lines = pd.read_sql(query_lines, conn)
         df_lines["line_type"] = df_lines["line_type"].astype(str).str.upper()
+
+        # ---------------------------------------------------------
+        # ⭐ ADDED LOGIC (A1)
+        # ---------------------------------------------------------
+        df_lines["tax_classification_code"] = df_lines.apply(
+            lambda r: r["tax_classification_code"] if str(r["line_type"]).upper() == "TAX" else "",
+            axis=1
+        )
+        print("✔ TAX logic applied to tax_classification_code")
 
         # ---------------------------------------------------------
         # 🔥 STEP 4 — SPLIT PER BUSINESS UNIT & GENERATE FBDI
@@ -417,25 +418,21 @@ if __name__ == "__main__":
             hdf = df_headers[df_headers['business_unit'] == bu].copy()
             ldf = df_lines[df_lines['invoice_id'].isin(hdf['invoice_id'])].copy()
 
-            # ⭐ NEW → AUTO-GENERATE attribute_1_fbdi
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             auto_value = f"BDOC_{bu}_{timestamp}"
 
             hdf["attribute_1_fbdi"] = auto_value
             print(f"✔ attribute_1_fbdi set to → {auto_value}")
 
-            # CLEAN AND ADD END
             hdf = add_end_column(clean_nulls(hdf))
             ldf = add_end_column(clean_nulls(ldf))
 
-            # FILE PATHS
             header_csv = os.path.join(OUTPUT_FOLDER, "ApInvoicesInterface.csv")
             lines_csv = os.path.join(OUTPUT_FOLDER, "ApInvoiceLinesInterface.csv")
 
             export_to_csv(hdf, header_csv)
             export_to_csv(ldf, lines_csv)
 
-            # ZIP NAME WITH BU + TIMESTAMP
             zip_path = os.path.join(
                 OUTPUT_FOLDER,
                 f"{bu.replace(' ', '_')}_apinvoiceimport_{timestamp}.zip"
