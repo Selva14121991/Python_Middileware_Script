@@ -10,9 +10,7 @@ import pandas as pd
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# =========================================================
-#                   FUSION CONFIG
-# =========================================================
+# ================== FUSION CONFIG ==================
 FUSION_BASE_URL = "https://fa-euth-dev58-saasfademo1.ds-fa.oraclepdemos.com:443"
 
 REPORT_SERVICE = f"{FUSION_BASE_URL}/xmlpserver/services/ExternalReportWSSService"
@@ -23,9 +21,7 @@ PASSWORD = "fusion123"
 # BI report path
 BI_REPORT_PATH = "/Custom/Master Integration Reports/AP_INVOICE_STATUS_REPORT/AP Interface Rej Det Rpt.xdo"
 
-# =========================================================
-#                   DB CONFIG
-# =========================================================
+# ================== DB CONFIG ==================
 DB_CONFIG = {
     "host": "4.188.251.57",
     "port": 5432,
@@ -35,39 +31,33 @@ DB_CONFIG = {
 }
 
 SCHEMA = "DocAI"
+TABLE_LOAD_REQ_ID = "oracle_ap_invoice_load_req_id_tbl"
 TABLE_HEADERS = "oracle_ap_invoice_headers"
-TABLE_LINES = "oracle_ap_invoice_lines"
 
-# =========================================================
-#           Database Connection
-# =========================================================
+
+# ================== DB CONNECTION ==================
 def get_db_connection():
     return psycopg2.connect(**DB_CONFIG)
 
-# =========================================================
-#     Fetch all Load Request IDs to update status
-# =========================================================
+
+# ================== FETCH LOAD REQUEST IDs ==================
 def get_load_request_ids():
-    print("🔌 Fetching LOAD_REQUEST_IDs from oracle_ap_invoice_headers …")
+    print("🔌 Fetching LOAD_REQUEST_IDs from DB …")
+
     conn = get_db_connection()
-    query = f'''
-        SELECT DISTINCT load_request_id
-        FROM "{SCHEMA}"."{TABLE_HEADERS}"
-        WHERE load_request_id IS NOT NULL
-          AND (erp_interface_status IS NULL OR erp_interface_status = 'Error' OR  status = 'P')
-        ORDER BY 1;
-    '''
+    query = f'SELECT DISTINCT "LOAD_REQUEST_ID" FROM "{SCHEMA}"."{TABLE_LOAD_REQ_ID}" ORDER BY 1;'
     df = pd.read_sql_query(query, conn)
     conn.close()
-    load_ids = df["load_request_id"].astype(str).tolist()
+
+    load_ids = df["LOAD_REQUEST_ID"].astype(str).tolist()
     print(f"📦 Retrieved {len(load_ids)} Load Request IDs")
     return load_ids
 
-# =========================================================
-#               CALL BI REPORT
-# =========================================================
+
+# ================== CALL BI REPORT ==================
 def call_bi_report(load_request_id):
     print(f"\n📡 Calling BI Report for Load Request ID: {load_request_id}")
+
     soap_body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
                xmlns:pub="http://xmlns.oracle.com/oxp/service/PublicReportService">
@@ -93,6 +83,7 @@ def call_bi_report(load_request_id):
    </soap:Body>
 </soap:Envelope>
 """
+
     resp = requests.post(
         REPORT_SERVICE,
         data=soap_body,
@@ -102,11 +93,12 @@ def call_bi_report(load_request_id):
         timeout=120
     )
 
+    print("🔎 HTTP Status:", resp.status_code)
+
     if resp.status_code != 200:
         print("❌ BI Report Failed:", resp.text)
         return None
 
-    # Parse XML
     root = ET.fromstring(resp.content)
     ns = {"ns": "http://xmlns.oracle.com/oxp/service/PublicReportService"}
 
@@ -115,77 +107,88 @@ def call_bi_report(load_request_id):
         print("⚠ No BI data found for this Load Request ID")
         return None
 
-    # Decode CSV
     csv_text = base64.b64decode(report_bytes.text).decode("utf-8-sig")
-    rows = list(csv.DictReader(StringIO(csv_text)))
 
+    print("\n📄 ==== RAW BI CSV RETURNED ====")
+    print(csv_text)
+    print("================================")
+
+    rows = list(csv.DictReader(StringIO(csv_text)))
     if not rows:
         print("⚠ CSV returned but empty!")
         return None
 
-    print(f"📄 BI Report returned {len(rows)} rows")
+    print("\n📌 ==== PARSED BI ROWS ====")
+    for idx, row in enumerate(rows, start=1):
+        print(f"Row {idx}: {row}")
+    print("============================")
+
     return rows
 
-# =========================================================
-#               BULK UPDATE HEADER AND LINE TABLES
-# =========================================================
-def update_invoice_bulk(rows):
+
+# ================== UPDATE HEADERS TABLE ==================
+def update_invoice_header(result_row):
+    invoice_num = result_row.get("INVOICE_NUM")
+    status = result_row.get("DOC_STATUS")
+    err = result_row.get("ERROR_DESCRIPTION")
+
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # --- Header update (always)
-    update_header_sql = f"""
+    update_sql = f"""
         UPDATE "{SCHEMA}"."{TABLE_HEADERS}"
         SET erp_interface_status = %s,
-                            status = %s,
             erp_interface_description = %s
         WHERE invoice_number = %s;
     """
-    header_values = [
-        (r.get("DOC_STATUS"),r.get("STATUS"), r.get("ERROR_DESCRIPTION"), r.get("INVOICE_NUM"))
-        for r in rows
-    ]
-    cur.executemany(update_header_sql, header_values)
-    print(f"📝 Bulk Updated Headers: {cur.rowcount}")
 
-    # --- Line update (only if C_LINE_LEVEL has value)
-    line_rows = [r for r in rows if r.get("C_LINE_LEVEL")]
-    if line_rows:
-        update_line_sql = f"""
-            UPDATE "{SCHEMA}"."{TABLE_LINES}"
-            SET erp_interface_status = 'Error',
-                erp_interface_description = %s,
-                erp_interface_desc_details = %s
-            WHERE invoice_id = %s
-              AND line_number = %s;
-        """
-        line_values = [
-            (r.get("ERROR_DESCRIPTION"),r.get("DESCRIPTION"), r.get("INVOICE_ID"), r.get("C_LINE_LEVEL"))
-            for r in line_rows
-        ]
-        cur.executemany(update_line_sql, line_values)
-        print(f"📝 Bulk Updated Lines: {cur.rowcount}")
-
+    cur.execute(update_sql, (status, err, invoice_num))
+    updated = cur.rowcount
     conn.commit()
-    cur.close()
     conn.close()
 
-# =========================================================
-#                     MAIN PROCESS
-# =========================================================
+    print(f"📝 Updated → invoice_number={invoice_num}, STATUS={status}, ERROR={err}, Rows affected={updated}")
+    return updated
+
+
+# ================== DELETE LOAD REQUEST ID ==================
+def delete_load_request_id(load_request_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    delete_sql = f'DELETE FROM "{SCHEMA}"."{TABLE_LOAD_REQ_ID}" WHERE "LOAD_REQUEST_ID" = %s;'
+    cur.execute(delete_sql, (load_request_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    conn.close()
+
+    print(f"🗑 Deleted LOAD_REQUEST_ID {load_request_id} → Rows removed={deleted}")
+
+
+# ================== MAIN ==================
 if __name__ == "__main__":
+
     load_ids = get_load_request_ids()
 
     for load_id in load_ids:
+
         print("\n=======================================")
         print(f"🔄 Processing Load Request ID: {load_id}")
         print("=======================================\n")
 
         rows = call_bi_report(load_id)
+
         if rows:
-            update_invoice_bulk(rows)
-            print(f"\n✅ Updated invoices and lines for LOAD_REQUEST_ID={load_id}")
+            update_count = 0
+
+            for r in rows:
+                update_count += update_invoice_header(r)
+
+            print(f"\n✅ Total {update_count} invoice records updated for LOAD_REQUEST_ID={load_id}")
+
+            delete_load_request_id(load_id)
+
         else:
-            print(f"⚠ No BI rows returned → No updates for LOAD_REQUEST_ID={load_id}")
+            print(f"⚠ No BI rows found → No update/delete for LOAD_REQUEST_ID={load_id}")
 
     print("\n🎉 COMPLETED PROCESSING ALL LOAD REQUEST IDs!")
