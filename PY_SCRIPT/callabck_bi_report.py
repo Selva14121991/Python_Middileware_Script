@@ -54,7 +54,7 @@ def get_load_request_ids():
         SELECT DISTINCT load_request_id
         FROM "{SCHEMA}"."{TABLE_HEADERS}"
         WHERE load_request_id IS NOT NULL
-          AND (erp_interface_status IS NULL OR erp_interface_status = 'Error')
+          AND (erp_interface_status IS NULL OR erp_interface_status = 'Error' OR  status = 'P')
         ORDER BY 1;
     '''
     df = pd.read_sql_query(query, conn)
@@ -125,7 +125,6 @@ def call_bi_report(load_request_id):
 
     print(f"📄 BI Report returned {len(rows)} rows")
     return rows
-
 # =========================================================
 #               BULK UPDATE HEADER AND LINE TABLES
 # =========================================================
@@ -137,33 +136,46 @@ def update_invoice_bulk(rows):
     update_header_sql = f"""
         UPDATE "{SCHEMA}"."{TABLE_HEADERS}"
         SET erp_interface_status = %s,
+            status = %s,
             erp_interface_description = %s
         WHERE invoice_number = %s;
     """
     header_values = [
-        (r.get("DOC_STATUS"), r.get("ERROR_DESCRIPTION"), r.get("INVOICE_NUM"))
+        (r.get("DOC_STATUS"), r.get("STATUS"), r.get("ERROR_DESCRIPTION"), r.get("INVOICE_NUM"))
         for r in rows
     ]
     cur.executemany(update_header_sql, header_values)
     print(f"📝 Bulk Updated Headers: {cur.rowcount}")
 
-    # --- Line update (only if C_LINE_LEVEL has value)
-    line_rows = [r for r in rows if r.get("C_LINE_LEVEL")]
-    if line_rows:
-        update_line_sql = f"""
-            UPDATE "{SCHEMA}"."{TABLE_LINES}"
-            SET erp_interface_status = 'Error',
-                erp_interface_description = %s,
-                erp_interface_desc_details = %s
-            WHERE invoice_id = %s
-              AND line_number = %s;
-        """
-        line_values = [
-            (r.get("ERROR_DESCRIPTION"),r.get("DESCRIPTION"), r.get("INVOICE_ID"), r.get("C_LINE_LEVEL"))
-            for r in line_rows
-        ]
-        cur.executemany(update_line_sql, line_values)
-        print(f"📝 Bulk Updated Lines: {cur.rowcount}")
+    # --- Line update
+    for r in rows:
+        invoice_id = r.get("INVOICE_ID")
+        line_number = r.get("C_LINE_LEVEL")
+        if line_number:  # Case 1: line exists
+            update_line_sql = f"""
+                UPDATE "{SCHEMA}"."{TABLE_LINES}"
+                SET erp_interface_status = 'Error',
+                    erp_interface_description = %s,
+                    erp_interface_desc_details = %s
+                WHERE invoice_id = %s
+                  AND line_number = %s;
+            """
+            cur.execute(update_line_sql, (
+                r.get("ERROR_DESCRIPTION"),
+                r.get("DESCRIPTION"),
+                invoice_id,
+                line_number
+            ))
+        else:  # Case 2: no line exists → clear description fields
+            update_line_sql = f"""
+                UPDATE "{SCHEMA}"."{TABLE_LINES}"
+                SET erp_interface_description = NULL,
+                    erp_interface_desc_details = NULL,
+                    erp_interface_status = NULL
+                WHERE invoice_id = %s;
+            """
+            cur.execute(update_line_sql, (invoice_id,))
+    print(f"📝 Lines updated (Error or NULL depending on C_LINE_LEVEL)")
 
     conn.commit()
     cur.close()
