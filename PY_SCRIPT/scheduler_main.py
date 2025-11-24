@@ -6,7 +6,7 @@ import os
 # ================== CONFIG ==================
 PROJECT_PATH = r"C:\Users\SelvagowthamSelvaman\PycharmProjects\PythonProject2"
 
-SCRIPT_2_MIN = os.path.join(PROJECT_PATH, "apinv_split_bu_rev05.py")
+SCRIPT_2_MIN = os.path.join(PROJECT_PATH, "apinv_split_bu_rev06.py")
 SCRIPT_3_MIN = os.path.join(PROJECT_PATH, "AP_INVOICE_INBND_MULTIPLE_REV04.py")
 SCRIPT_5_MIN = os.path.join(PROJECT_PATH, "invoke_bi_report_callback_rev02.py")
 
