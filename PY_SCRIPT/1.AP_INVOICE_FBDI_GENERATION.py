@@ -379,109 +379,114 @@ if __name__ == "__main__":
         """
         df_lines = pd.read_sql(query_lines, engine)
         df_lines["line_type"] = df_lines["line_type"].astype(str).str.upper()
-
+#===============================
         # ======================================================================
-        #   AUTO-GENERATE TAX LINES (GROUPED BY TAX RATE) – REWRITTEN
+        #   AUTO-GENERATE TAX LINES (USING ITEM line_amount × tax_rate)
         # ======================================================================
 
         if len(df_headers) > 0:
             print("📌 Header records found → proceeding with TAX line generation...")
 
-            # Fetch all invoice lines for invoices to process
-            orig_lines_query = f"""
-                  SELECT invoice_id, line_number, line_type,
-                         amount, tax_control_amount, tax_rate
-                  FROM "{SCHEMA}"."{TABLE_LINES}"
-                  WHERE invoice_id IN (
-                      SELECT invoice_id
-                      FROM "{SCHEMA}"."{TABLE_HEADERS}"
-                      WHERE status = 'A'
-                        AND business_unit <> ''
-                        AND (erp_interface_status IS NULL OR erp_interface_status = 'Error')
-                  );
-              """
-            df_orig = pd.read_sql(orig_lines_query, engine)
-            df_orig["line_type"] = df_orig["line_type"].astype(str).str.upper()
+        # Fetch ITEM lines for eligible invoices
+        orig_lines_query = f"""
+              SELECT invoice_id, line_number, line_type,
+                     unit_price, invoice_quantity, line_amount, tax_rate
+              FROM "{SCHEMA}"."{TABLE_LINES}"
+              WHERE invoice_id IN (
+                  SELECT invoice_id
+                  FROM "{SCHEMA}"."{TABLE_HEADERS}"
+                  WHERE status = 'A'
+                    AND business_unit <> ''
+              );
+        """
+        df_lines = pd.read_sql(orig_lines_query, engine)
+        df_lines["line_type"] = df_lines["line_type"].astype(str).str.upper()
 
-            auto_tax_lines = []
+        mask_item = df_lines["line_type"] == "ITEM"
 
-            # Group by invoice_id
-            for invoice_id, group in df_orig.groupby("invoice_id"):
-
-                # Skip invoices that already have TAX lines
-                if "TAX" in group["line_type"].values:
-                    continue
-
-                # Only process ITEM lines
-                item_lines = group[group["line_type"] == "ITEM"].copy()
-                if item_lines.empty:
-                    continue
+        # ----------------- STEP 1: RECALCULATE ITEM line_amount -----------------
+        df_lines["unit_price"] = pd.to_numeric(df_lines["unit_price"], errors='coerce').fillna(0.0)
+        df_lines["invoice_quantity"] = pd.to_numeric(df_lines["invoice_quantity"], errors='coerce').fillna(0.0)
+        df_lines.loc[mask_item, "line_amount"] = (
+                df_lines.loc[mask_item, "unit_price"] * df_lines.loc[mask_item, "invoice_quantity"]
+        ).round(2)
 
 
-                # =============================================================
-                #   Determine final_tax_rate for each line
-                # =============================================================
-                def derive_tax_rate(row):
-                    # Priority 1: Use existing tax_rate if valid
-                    if pd.notna(row["tax_rate"]) and float(row["tax_rate"]) > 0:
-                        return float(row["tax_rate"])
-                    # Priority 2: Derive from tax_control_amount / amount
-                    if pd.notna(row["tax_control_amount"]) and float(row["tax_control_amount"]) > 0:
-                        return round((float(row["tax_control_amount"]) / float(row["amount"])) * 100, 4)
-                    return None
+        # ----------------- STEP 2: CALCULATE tax_control_amount -----------------
+        def normalize_tax_rate(x):
+            if pd.isna(x):
+                return 0.0
+            x = float(x)
+            return x * 100 if x < 1 else x
 
 
-                item_lines["final_tax_rate"] = item_lines.apply(derive_tax_rate, axis=1)
-                item_lines = item_lines[item_lines["final_tax_rate"].notna()]
-                if item_lines.empty:
-                    continue
+        df_lines["tax_rate"] = pd.to_numeric(df_lines["tax_rate"], errors='coerce').fillna(0.0)
+        df_lines.loc[mask_item, "adjusted_tax_rate"] = df_lines.loc[mask_item, "tax_rate"].apply(normalize_tax_rate)
+        df_lines.loc[mask_item, "tax_control_amount"] = (
+                df_lines.loc[mask_item, "line_amount"] * df_lines.loc[mask_item, "adjusted_tax_rate"] / 100
+        ).round(2)
 
-                # =============================================================
-                #   Normalize fractional rates (0.16 → 16.0)
-                # =============================================================
-                item_lines["final_tax_rate"] = item_lines["final_tax_rate"].apply(lambda x: x * 100 if x < 1 else x)
+        # ----------------- STEP 3: BULK UPDATE tax_control_amount -----------------
+        update_values = [
+            (float(row.tax_control_amount), int(row.invoice_id), int(row.line_number))
+            for row in df_lines[mask_item].itertuples()
+        ]
+        update_sql = f"""
+            UPDATE "{SCHEMA}"."{TABLE_LINES}" AS L
+            SET tax_control_amount = data.tax_control_amount
+            FROM (VALUES %s) AS data(tax_control_amount, invoice_id, line_number)
+            WHERE L.invoice_id = data.invoice_id::BIGINT
+              AND L.line_number = data.line_number::INT;
+        """
+        execute_values(cursor, update_sql, update_values)
+        conn.commit()
+        print(f"✔ Updated tax_control_amount for {len(update_values)} ITEM lines.")
 
-                # =============================================================
-                #   Group by tax rate and calculate TAX amount
-                # =============================================================
-                tax_groups = item_lines.groupby("final_tax_rate")
-                next_line_number = group["line_number"].max() + 1
+        # ----------------- STEP 4: GENERATE TAX LINES -----------------
+        auto_tax_lines = []
 
-                for tax_rate, grp in tax_groups:
-                    total_item_amount = grp["amount"].sum()
-                    tax_amount = round((total_item_amount * float(tax_rate)) / 100, 2)
+        for invoice_id, group in df_lines.groupby("invoice_id"):
 
-                    auto_tax_lines.append(
-                        (
-                            int(invoice_id),
-                            int(next_line_number),
-                            "TAX",
-                            float(tax_amount),
-                            float(tax_rate)
-                        )
+            # Skip if TAX line already exists
+            if "TAX" in group["line_type"].values:
+                continue
+
+            item_lines = group[group["line_type"] == "ITEM"]
+            if item_lines.empty:
+                continue
+
+            next_line_number = group["line_number"].max() + 1
+            tax_groups = item_lines.groupby("adjusted_tax_rate")
+
+            for tax_rate, grp in tax_groups:
+                tax_amount = grp["tax_control_amount"].sum().round(2)
+                auto_tax_lines.append(
+                    (
+                        int(invoice_id),
+                        int(next_line_number),
+                        "TAX",
+                        float(tax_amount),
+                        float(tax_rate)
                     )
-                    next_line_number += 1
+                )
+                next_line_number += 1
 
-            # =============================================================
-            #   INSERT GENERATED TAX LINES INTO DB
-            # =============================================================
-            if auto_tax_lines:
-                print(f"➕ Creating {len(auto_tax_lines)} grouped TAX lines...")
+        # ----------------- STEP 5: INSERT TAX LINES -----------------
+        if auto_tax_lines:
+            print(f"➕ Creating {len(auto_tax_lines)} TAX lines...")
 
-                insert_sql = f"""
-                      INSERT INTO "{SCHEMA}"."{TABLE_LINES}"
-                      (invoice_id, line_number, line_type, amount, tax_rate)
-                      VALUES %s;
-                  """
-                execute_values(cursor, insert_sql, auto_tax_lines)
-                conn.commit()
-                print("✔ Auto-generated TAX lines inserted.")
+            insert_sql = f"""
+                  INSERT INTO "{SCHEMA}"."{TABLE_LINES}"
+                  (invoice_id, line_number, line_type, amount, tax_rate)
+                  VALUES %s;
+              """
+            execute_values(cursor, insert_sql, auto_tax_lines)
+            conn.commit()
+            print("✔ Auto-generated TAX lines inserted.")
+        else:
+            print("✔ No missing TAX lines detected.")
 
-                # Refresh df_lines
-                df_lines = pd.read_sql(query_lines, engine)
-                df_lines["line_type"] = df_lines["line_type"].astype(str).str.upper()
-            else:
-                print("✔ No missing TAX lines detected.")
+        # ===============================
         # ======================================================================
         #   STEP 4: APPLY TAX MASTER (your original code continues unchanged)
         # ======================================================================
