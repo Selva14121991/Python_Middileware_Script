@@ -12,7 +12,7 @@ SCRIPT_5_MIN = os.path.join(PROJECT_PATH, "invoke_bi_report_callback_rev02.py")
 
 # ================== JOB FUNCTIONS ==================
 def run_2_min_script():
-    print("⏱ Running apinv_split_bu_rev05.py (every 2 minutes)")
+    print("⏱ Running apinv_split_bu_rev06.py (every 2 minutes)")
     subprocess.Popen(["python", SCRIPT_2_MIN])
 
 def run_3_min_script():
